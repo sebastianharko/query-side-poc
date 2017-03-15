@@ -3,7 +3,7 @@ package querysidepoc
 
 import akka.actor.{ActorLogging, ActorSystem, Props}
 import akka.cluster.sharding.{ClusterSharding, ClusterShardingSettings, ShardRegion}
-import akka.event.LoggingReceive
+import akka.event.{Logging, LoggingReceive}
 import akka.pattern.ask
 import akka.persistence.PersistentActor
 import akka.stream._
@@ -95,12 +95,15 @@ object AccountActor {
 }
 
 
+class Main
 
 object Main extends App {
 
   implicit val system = ActorSystem("query-side-poc")
 
   implicit val materializer = ActorMaterializer()
+
+  val logging = Logging(system, classOf[Main])
 
   val shardingForAccounts = ClusterSharding(system).start(
       typeName = "account",
@@ -135,26 +138,27 @@ object Main extends App {
 
     val Src: Outlet[HolderAddedToAccount] = builder.add(source).out
 
-    val Emision =
+    val Publicar =
       builder.add(Broadcast[HolderAddedToAccount](2))
 
     val Cambio
       = builder.add(Flow[HolderAddedToAccount].map(item => item.copy(accountId = "ING-" + item.accountId)))
 
-    val PublicarCuenta
+    val AlaCuenta
       = builder.add(Flow[HolderAddedToAccount].mapAsync(10)(event =>
           (shardingForAccounts ? event).mapTo[String]))
 
-    val PublicarPosicionGlobal
+    val AlaPosicionGlobal
       = builder.add(Flow[HolderAddedToAccount].mapAsync(10)(event =>
          (shardingForPosicionGlobal ? event).mapTo[String]))
 
     val Unir = builder.add(Zip[String, String])
 
-    val Final: FlowShape[(String, String), String]
+    val Comprobar: FlowShape[(String, String), String]
       = builder.add(Flow[(String, String)].map(tuple => {
+          logging.info("received " + tuple._1 + " and " + tuple._2)
           val items = List(tuple._1, tuple._2)
-          if (items.distinct.size == 1 && items.head == "success")
+          if (items.distinct.size == 1 && items.head == "Success")
              "success"
            else
             "failure"
@@ -177,16 +181,14 @@ object Main extends App {
 
     */
 
-    Src ~> Cambio ~> Emision ~> PublicarCuenta         ~> Unir.in0
-                     Emision ~> PublicarPosicionGlobal ~> Unir.in1
-                                                          Unir.out ~> Final ~> Sumidero
+    Src ~> Cambio ~> Publicar ~> AlaCuenta         ~> Unir.in0
+                     Publicar ~> AlaPosicionGlobal ~> Unir.in1
+                                                      Unir.out ~> Comprobar ~> Sumidero
 
     ClosedShape
   })
 
   graph.run()
-
-
 
 }
 
