@@ -1,7 +1,7 @@
 package querysidepoc
 
 
-import akka.actor.{ActorLogging, ActorRef, ActorSystem, Props}
+import akka.actor.{ActorLogging, ActorSystem, Props}
 import akka.cluster.sharding.{ClusterSharding, ClusterShardingSettings, ShardRegion}
 import akka.event.{Logging, LoggingReceive}
 import akka.http.scaladsl.Http
@@ -10,38 +10,38 @@ import akka.http.scaladsl.server.Directives._
 import akka.pattern.ask
 import akka.persistence.PersistentActor
 import akka.stream._
-import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, RunnableGraph, Sink, Source, Zip}
+import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Sink, Source, Zip}
 import org.json4s.{DefaultFormats, jackson}
 
 import scala.collection.mutable
 
 
-case class TitularAnadidoALaCuenta(accountId: String,
-                                   newHolderId: String)
+case class TitularAnadidoALaCuenta(cuentaId: String,
+                                   nuevaTitularId: String)
 
 
-object ActorPosicionGlobal {
+object ActorTitular {
 
-  def props = Props(new ActorPosicionGlobal)
+  def props = Props(new ActorTitular)
 
   val extractEntityId: ShardRegion.ExtractEntityId = {
-    case msg @ TitularAnadidoALaCuenta(_, newHolderId) ⇒ (newHolderId, msg)
-    case msg @ ObtenerPosicionGlobal(personaId)  => (personaId, msg)
+    case msg @ TitularAnadidoALaCuenta(_, nuevaTitularId) ⇒ (nuevaTitularId, msg)
+    case msg @ ObtenerCuentasForTitular(personaId)  => (personaId, msg)
   }
 
   val extractShardId: ShardRegion.ExtractShardId = {
-    case TitularAnadidoALaCuenta(accountId, newHolderId) => newHolderId.head.toString
-    case ObtenerPosicionGlobal(personaId) => personaId.head.toString
+    case TitularAnadidoALaCuenta(cuentaId, nuevaTitularId) => nuevaTitularId.head.toString
+    case ObtenerCuentasForTitular(personaId) => personaId.head.toString
 
   }
 
 }
 
-case class ObtenerPosicionGlobal(personaId: String)
+case class ObtenerCuentasForTitular(personaId: String)
 
-case class PosicionGlobalDTO(cuentas: List[String])
+case class TitularDTO(cuentas: List[String])
 
-class ActorPosicionGlobal extends PersistentActor with ActorLogging {
+class ActorTitular extends PersistentActor with ActorLogging {
 
   val cuentas: mutable.Set[String] = mutable.Set()
 
@@ -55,13 +55,13 @@ class ActorPosicionGlobal extends PersistentActor with ActorLogging {
           sender ! "Success"
         }
       }
-    case msg @ ObtenerPosicionGlobal(personaId) =>
-      sender ! PosicionGlobalDTO(cuentas.toList)
+    case msg @ ObtenerCuentasForTitular(personaId) =>
+      sender ! TitularDTO(cuentas.toList)
   }
 
   override def receiveRecover = {
-    case TitularAnadidoALaCuenta(accountId, _) =>
-      cuentas.add(accountId)
+    case TitularAnadidoALaCuenta(cuentaId, _) =>
+      cuentas.add(cuentaId)
   }
 
 }
@@ -77,17 +77,17 @@ class ActorCuenta extends PersistentActor with ActorLogging {
   val titulares = mutable.ArrayBuffer[String]()
 
   override def receiveCommand = LoggingReceive {
-    case msg@TitularAnadidoALaCuenta(accountId, newHolderId) =>
+    case msg@TitularAnadidoALaCuenta(cuentaId, titularId) =>
       persist(msg) { event =>
-        titulares.append(event.newHolderId)
+        titulares.append(event.nuevaTitularId)
         sender ! "Success"
       }
     case ObtenerTitulares(_) => sender() ! TitularesDTO(titulares.toList)
   }
 
   def receiveRecover = {
-    case TitularAnadidoALaCuenta(accountId, newHolderId) =>
-      titulares.append(newHolderId)
+    case TitularAnadidoALaCuenta(cuentaId, nuevoTitularId) =>
+      titulares.append(nuevoTitularId)
   }
 
 }
@@ -98,7 +98,7 @@ object ActorCuenta {
   def props = Props(new ActorCuenta)
 
   val extractEntityId: ShardRegion.ExtractEntityId = {
-    case msg @ TitularAnadidoALaCuenta(accountId, newHolderId) ⇒ (accountId, msg)
+    case msg @ TitularAnadidoALaCuenta(cuentaId, nuevoTitularId) ⇒ (cuentaId, msg)
     case msg @ ObtenerTitulares(cuentaId) => (cuentaId, msg)
   }
 
@@ -140,11 +140,11 @@ object Main extends App {
   )
 
   val shardingParaPosicionGlobal = ClusterSharding(system).start(
-    typeName = "posicion global",
-    entityProps = ActorPosicionGlobal.props,
+    typeName = "titulares",
+    entityProps = ActorTitular.props,
     settings = ClusterShardingSettings(system),
-    extractEntityId = ActorPosicionGlobal.extractEntityId,
-    extractShardId = ActorPosicionGlobal.extractShardId
+    extractEntityId = ActorTitular.extractEntityId,
+    extractShardId = ActorTitular.extractShardId
   )
 
 
@@ -156,13 +156,13 @@ object Main extends App {
       val Publicar =
         builder.add(Broadcast[TitularAnadidoALaCuenta](2))
 
-      val Enriquecer = builder.add(Flow[TitularAnadidoALaCuenta].map(item => item.copy(accountId = "CUENTA-" + item.accountId)))
+      val Enriquecer = builder.add(Flow[TitularAnadidoALaCuenta].map(item => item.copy(cuentaId = "CUENTA-" + item.cuentaId)))
 
       val AlaCuenta
       = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event =>
         (shardingParaCuentas ? event).mapTo[String]))
 
-      val AlaPosicionGlobal
+      val AlTitular
       = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event =>
         (shardingParaPosicionGlobal ? event).mapTo[String]))
 
@@ -179,9 +179,9 @@ object Main extends App {
       }
       ))
 
-       Enriquecer ~> Publicar ~> AlaCuenta         ~> Unir.in0
-                     Publicar ~> AlaPosicionGlobal ~> Unir.in1
-                                                      Unir.out ~> Comprobar
+       Enriquecer ~> Publicar ~> AlaCuenta   ~> Unir.in0
+                     Publicar ~> AlTitular   ~> Unir.in1
+                                                Unir.out ~> Comprobar
 
        FlowShape(Enriquecer.in, Comprobar.out)
 
@@ -207,9 +207,9 @@ object Main extends App {
       }
     }
   } ~ get {
-    path("posicion" / Segment) {
+    path("titular" / Segment) {
       personaId: String => {
-        onComplete((shardingParaPosicionGlobal ? ObtenerPosicionGlobal(personaId)).mapTo[PosicionGlobalDTO]) {
+        onComplete((shardingParaPosicionGlobal ? ObtenerCuentasForTitular(personaId)).mapTo[TitularDTO]) {
           case scala.util.Success(dto) => complete(OK -> dto)
           case scala.util.Failure(_) => complete(InternalServerError)
         }
