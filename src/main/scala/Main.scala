@@ -136,12 +136,12 @@ object Main extends App {
   val graph =
   RunnableGraph.fromGraph(GraphDSL.create() { implicit builder =>
 
-    val Src: Outlet[HolderAddedToAccount] = builder.add(source).out
+    val Src = builder.add(source).out
 
     val Publicar =
       builder.add(Broadcast[HolderAddedToAccount](2))
 
-    val Cambio
+    val Enriquecer
       = builder.add(Flow[HolderAddedToAccount].map(item => item.copy(accountId = "ING-" + item.accountId)))
 
     val AlaCuenta
@@ -154,7 +154,7 @@ object Main extends App {
 
     val Unir = builder.add(Zip[String, String])
 
-    val Comprobar: FlowShape[(String, String), String]
+    val Comprobar
       = builder.add(Flow[(String, String)].map(tuple => {
           logging.info("received " + tuple._1 + " and " + tuple._2)
           val items = List(tuple._1, tuple._2)
@@ -166,24 +166,11 @@ object Main extends App {
     ))
 
     val Sumidero = builder.add(Sink.foreach(println)).in
+    
 
-    /*
-    val C: UniformFanInShape[Int, Int]    = builder.add(Merge[Int](2))
-    val D: FlowShape[Int, Int]            = builder.add(Flow[Int].map(_ + 1))
-    val E: UniformFanOutShape[Int, Int]   = builder.add(Balance[Int](2))
-    val F: UniformFanInShape[Int, Int]    = builder.add(Merge[Int](2))
-    val G: Inlet[Any]                     = builder.add(Sink.foreach(println)).in
-
-                     C     <~      F
-    A  ~>     B  ~>  C     ~>      F
-              B  ~>  D  ~>  E  ~>  F
-                            E  ~>  G
-
-    */
-
-    Src ~> Cambio ~> Publicar ~> AlaCuenta         ~> Unir.in0
-                     Publicar ~> AlaPosicionGlobal ~> Unir.in1
-                                                      Unir.out ~> Comprobar ~> Sumidero
+    Src ~> Enriquecer ~> Publicar ~> AlaCuenta         ~> Unir.in0
+                         Publicar ~> AlaPosicionGlobal ~> Unir.in1
+                                                          Unir.out ~> Comprobar ~> Sumidero
 
     ClosedShape
   })
