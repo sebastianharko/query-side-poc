@@ -96,7 +96,7 @@ object AccountActor {
 
 
 
-object Main {
+object Main extends App {
 
   implicit val system = ActorSystem("query-side-poc")
 
