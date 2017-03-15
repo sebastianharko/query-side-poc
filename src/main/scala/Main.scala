@@ -1,7 +1,7 @@
 package querysidepoc
 
 
-import akka.actor.{ActorLogging, ActorSystem, Props}
+import akka.actor.{ActorLogging, ActorRef, ActorSystem, Props}
 import akka.cluster.sharding.{ClusterSharding, ClusterShardingSettings, ShardRegion}
 import akka.event.{Logging, LoggingReceive}
 import akka.http.scaladsl.Http
@@ -107,7 +107,6 @@ object ActorCuenta {
     case msg @ ObtenerTitulares(cuentaId) => cuentaId.head.toString
   }
 }
-
 
 class Main
 
