@@ -25,16 +25,21 @@ object ActorPosicionGlobal {
   def props = Props(new ActorPosicionGlobal)
 
   val extractEntityId: ShardRegion.ExtractEntityId = {
-    case msg@TitularAnadidoALaCuenta(_, newHolderId) ⇒ (newHolderId, msg)
+    case msg @ TitularAnadidoALaCuenta(_, newHolderId) ⇒ (newHolderId, msg)
+    case msg @ ObtenerPosicionGlobal(personaId)  => (personaId, msg)
   }
 
   val extractShardId: ShardRegion.ExtractShardId = {
     case TitularAnadidoALaCuenta(accountId, newHolderId) => newHolderId.head.toString
+    case ObtenerPosicionGlobal(personaId) => personaId.head.toString
 
   }
 
 }
 
+case class ObtenerPosicionGlobal(personaId: String)
+
+case class PosicionGlobalDTO(cuentas: List[String])
 
 class ActorPosicionGlobal extends PersistentActor with ActorLogging {
 
@@ -43,13 +48,15 @@ class ActorPosicionGlobal extends PersistentActor with ActorLogging {
   override def persistenceId = self.path.name
 
   override def receiveCommand = LoggingReceive {
-    case msg@TitularAnadidoALaCuenta(accountId, _) =>
+    case msg @ TitularAnadidoALaCuenta(cuentaId, _) =>
       persist(msg) {
         event => {
-          cuentas.add(accountId)
+          cuentas.add(cuentaId)
           sender ! "Success"
         }
       }
+    case msg @ ObtenerPosicionGlobal(personaId) =>
+      sender ! PosicionGlobalDTO(cuentas.toList)
   }
 
   override def receiveRecover = {
@@ -114,8 +121,7 @@ object Main extends App {
 
   implicit val materializer = ActorMaterializer()
 
-  // val sourceActorRef: ActorRef = ???
-
+  val actorRefSource = Source.actorRef[TitularAnadidoALaCuenta](100, OverflowStrategy.fail)
 
   import de.heikoseeberger.akkahttpjson4s.Json4sSupport._
 
@@ -142,44 +148,15 @@ object Main extends App {
   )
 
 
-  val route = post {
-    path("cuenta" / Segment / "titular" / Segment) {
-      (cuentaId: String, titularId: String) => {
-        val event = TitularAnadidoALaCuenta(cuentaId, titularId)
-        // sourceActorRef ! event
-        complete(OK)
-      }
-    }
-  } ~ get {
-    path("cuenta" / Segment) {
-      cuentaId: String => {
-        onComplete((shardingParaCuentas ? ObtenerTitulares(cuentaId)).mapTo[TitularesDTO]) {
-          case scala.util.Success(dto) => complete(OK -> dto)
-          case scala.util.Failure(_) => complete(InternalServerError)
-        }
-      }
-    }
-  }
-
-  Http().bindAndHandle(route, "localhost", 8080)
-
-
-  val exampleEvent = TitularAnadidoALaCuenta(accountId = "12710", newHolderId = "74")
-
-  val source = Source.single(exampleEvent)
-
   import akka.stream.scaladsl.GraphDSL.Implicits._
 
-  val graph =
-    RunnableGraph.fromGraph(GraphDSL.create() { implicit builder =>
-
-      val Eventos = builder.add(source).out
+  val flow =
+    Flow.fromGraph(GraphDSL.create() { implicit builder =>
 
       val Publicar =
         builder.add(Broadcast[TitularAnadidoALaCuenta](2))
 
-      val Enriquecer
-      = builder.add(Flow[TitularAnadidoALaCuenta].map(item => item.copy(accountId = "ING-" + item.accountId)))
+      val Enriquecer = builder.add(Flow[TitularAnadidoALaCuenta].map(item => item.copy(accountId = "CUENTA-" + item.accountId)))
 
       val AlaCuenta
       = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event =>
@@ -202,17 +179,47 @@ object Main extends App {
       }
       ))
 
-      val Sumidero = builder.add(Sink.foreach(println)).in
+       Enriquecer ~> Publicar ~> AlaCuenta         ~> Unir.in0
+                     Publicar ~> AlaPosicionGlobal ~> Unir.in1
+                                                      Unir.out ~> Comprobar
 
+       FlowShape(Enriquecer.in, Comprobar.out)
 
-      Eventos ~> Enriquecer ~> Publicar ~> AlaCuenta         ~> Unir.in0
-                               Publicar ~> AlaPosicionGlobal ~> Unir.in1
-                                                                Unir.out ~> Comprobar ~> Sumidero
-
-      ClosedShape
     })
 
-  graph.run()
+  val sourceActorRef = flow.runWith(actorRefSource, Sink.foreach(msg => logging.info("acknowledge")))._1
+
+  val route = post {
+    path("cuenta" / Segment / "titular" / Segment) {
+      (cuentaId: String, titularId: String) => {
+        val event = TitularAnadidoALaCuenta(cuentaId, titularId)
+        sourceActorRef ! event
+        complete(OK)
+      }
+    }
+  } ~ get {
+    path("cuenta" / Segment) {
+      cuentaId: String => {
+        onComplete((shardingParaCuentas ? ObtenerTitulares(cuentaId)).mapTo[TitularesDTO]) {
+          case scala.util.Success(dto) => complete(OK -> dto)
+          case scala.util.Failure(_) => complete(InternalServerError)
+        }
+      }
+    }
+  } ~ get {
+    path("posicion" / Segment) {
+      personaId: String => {
+        onComplete((shardingParaPosicionGlobal ? ObtenerPosicionGlobal(personaId)).mapTo[PosicionGlobalDTO]) {
+          case scala.util.Success(dto) => complete(OK -> dto)
+          case scala.util.Failure(_) => complete(InternalServerError)
+        }
+      }
+    }
+  }
+
+  Http().bindAndHandle(route, "localhost", 8080)
+
+
 
 }
 
