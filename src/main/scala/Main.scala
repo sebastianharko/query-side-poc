@@ -1,96 +1,103 @@
 package querysidepoc
 
 
-import akka.actor.{ActorLogging, ActorSystem, Props}
+import akka.actor.{ActorLogging, ActorRef, ActorSystem, Props}
 import akka.cluster.sharding.{ClusterSharding, ClusterShardingSettings, ShardRegion}
 import akka.event.{Logging, LoggingReceive}
+import akka.http.scaladsl.Http
+import akka.http.scaladsl.model.StatusCodes._
+import akka.http.scaladsl.server.Directives._
 import akka.pattern.ask
 import akka.persistence.PersistentActor
 import akka.stream._
-import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Merge, RunnableGraph, Sink, Source, Zip}
+import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, RunnableGraph, Sink, Source, Zip}
+import org.json4s.{DefaultFormats, jackson}
 
 import scala.collection.mutable
 
 
-case class AccountInformation(accountId: String,
-                              holders: List[String])
-
-case class HolderAddedToAccount(accountId: String,
-                                newHolderId: String)
+case class TitularAnadidoALaCuenta(accountId: String,
+                                   newHolderId: String)
 
 
-object GlobalPositionActor {
+object ActorPosicionGlobal {
 
-  def props = Props(new GlobalPositionActor)
+  def props = Props(new ActorPosicionGlobal)
 
   val extractEntityId: ShardRegion.ExtractEntityId = {
-    case msg @ HolderAddedToAccount(_, newHolderId) ⇒ (newHolderId, msg)
+    case msg@TitularAnadidoALaCuenta(_, newHolderId) ⇒ (newHolderId, msg)
   }
 
   val extractShardId: ShardRegion.ExtractShardId = {
-    case HolderAddedToAccount(accountId, newHolderId) => newHolderId.head.toString
+    case TitularAnadidoALaCuenta(accountId, newHolderId) => newHolderId.head.toString
 
   }
 
 }
 
 
-class GlobalPositionActor extends PersistentActor with ActorLogging {
+class ActorPosicionGlobal extends PersistentActor with ActorLogging {
 
-  val myAccounts: mutable.Set[String] = mutable.Set()
+  val cuentas: mutable.Set[String] = mutable.Set()
 
   override def persistenceId = self.path.name
 
   override def receiveCommand = LoggingReceive {
-    case msg@HolderAddedToAccount(accountId, _) =>
+    case msg@TitularAnadidoALaCuenta(accountId, _) =>
       persist(msg) {
         event => {
-          myAccounts.add(accountId)
+          cuentas.add(accountId)
           sender ! "Success"
         }
       }
   }
 
   override def receiveRecover = {
-    case HolderAddedToAccount(accountId, _) =>
-      myAccounts.add(accountId)
+    case TitularAnadidoALaCuenta(accountId, _) =>
+      cuentas.add(accountId)
   }
 
 }
 
-class AccountActor extends PersistentActor with ActorLogging {
+case class TitularesDTO(titulares: List[String])
+
+case class ObtenerTitulares(cuentaId: String)
+
+class ActorCuenta extends PersistentActor with ActorLogging {
 
   override def persistenceId = self.path.name
 
-  val holdersList = mutable.ArrayBuffer[String]()
+  val titulares = mutable.ArrayBuffer[String]()
 
-  override def receiveCommand =  LoggingReceive {
-    case msg@HolderAddedToAccount(accountId, newHolderId) =>
+  override def receiveCommand = LoggingReceive {
+    case msg@TitularAnadidoALaCuenta(accountId, newHolderId) =>
       persist(msg) { event =>
-        holdersList.append(event.newHolderId)
+        titulares.append(event.newHolderId)
         sender ! "Success"
       }
+    case ObtenerTitulares(_) => sender() ! TitularesDTO(titulares.toList)
   }
 
   def receiveRecover = {
-    case HolderAddedToAccount(accountId, newHolderId) =>
-      holdersList.append(newHolderId)
+    case TitularAnadidoALaCuenta(accountId, newHolderId) =>
+      titulares.append(newHolderId)
   }
 
 }
 
-object AccountActor {
+object ActorCuenta {
 
 
-  def props = Props(new AccountActor)
+  def props = Props(new ActorCuenta)
 
   val extractEntityId: ShardRegion.ExtractEntityId = {
-    case msg @ HolderAddedToAccount(accountId, newHolderId) ⇒ (accountId, msg)
+    case msg @ TitularAnadidoALaCuenta(accountId, newHolderId) ⇒ (accountId, msg)
+    case msg @ ObtenerTitulares(cuentaId) => (cuentaId, msg)
   }
 
   val extractShardId: ShardRegion.ExtractShardId = {
-    case HolderAddedToAccount(accountId, newHolderId) => accountId.head.toString
-
+    case TitularAnadidoALaCuenta(cuentaId, nuevoTitularId) => cuentaId.head.toString
+    case msg @ ObtenerTitulares(cuentaId) => cuentaId.head.toString
   }
 }
 
@@ -99,89 +106,115 @@ class Main
 
 object Main extends App {
 
+  import scala.concurrent.duration._
+
+  implicit val timeout = akka.util.Timeout(10 seconds)
+
   implicit val system = ActorSystem("query-side-poc")
 
   implicit val materializer = ActorMaterializer()
 
+  // val sourceActorRef: ActorRef = ???
+
+
+  import de.heikoseeberger.akkahttpjson4s.Json4sSupport._
+
+  implicit val serialization = jackson.Serialization
+  implicit val formats = DefaultFormats
+
+
   val logging = Logging(system, classOf[Main])
 
-  val shardingForAccounts = ClusterSharding(system).start(
-      typeName = "account",
-      entityProps = AccountActor.props,
-      settings = ClusterShardingSettings(system),
-      extractEntityId = AccountActor.extractEntityId,
-      extractShardId = AccountActor.extractShardId
-  )
-
-  val shardingForPosicionGlobal = ClusterSharding(system).start(
-    typeName = "posicion global",
-    entityProps = GlobalPositionActor.props,
+  val shardingParaCuentas = ClusterSharding(system).start(
+    typeName = "cuenta",
+    entityProps = ActorCuenta.props,
     settings = ClusterShardingSettings(system),
-    extractEntityId = GlobalPositionActor.extractEntityId,
-    extractShardId = GlobalPositionActor.extractShardId
+    extractEntityId = ActorCuenta.extractEntityId,
+    extractShardId = ActorCuenta.extractShardId
+  )
+
+  val shardingParaPosicionGlobal = ClusterSharding(system).start(
+    typeName = "posicion global",
+    entityProps = ActorPosicionGlobal.props,
+    settings = ClusterShardingSettings(system),
+    extractEntityId = ActorPosicionGlobal.extractEntityId,
+    extractShardId = ActorPosicionGlobal.extractShardId
   )
 
 
+  val route = post {
+    path("cuenta" / Segment / "titular" / Segment) {
+      (cuentaId: String, titularId: String) => {
+        val event = TitularAnadidoALaCuenta(cuentaId, titularId)
+        // sourceActorRef ! event
+        complete(OK)
+      }
+    }
+  } ~ get {
+    path("cuenta" / Segment) {
+      cuentaId: String => {
+        onComplete((shardingParaCuentas ? ObtenerTitulares(cuentaId)).mapTo[TitularesDTO]) {
+          case scala.util.Success(dto) => complete(OK -> dto)
+          case scala.util.Failure(_) => complete(InternalServerError)
+        }
+      }
+    }
+  }
 
-  val exampleEvent = HolderAddedToAccount(accountId = "12710", newHolderId = "74")
+  Http().bindAndHandle(route, "localhost", 8080)
 
+
+  val exampleEvent = TitularAnadidoALaCuenta(accountId = "12710", newHolderId = "74")
 
   val source = Source.single(exampleEvent)
-
-  import scala.concurrent.duration._
-  implicit val timeout = akka.util.Timeout(10 seconds)
 
   import akka.stream.scaladsl.GraphDSL.Implicits._
 
   val graph =
-  RunnableGraph.fromGraph(GraphDSL.create() { implicit builder =>
+    RunnableGraph.fromGraph(GraphDSL.create() { implicit builder =>
 
-    val Src = builder.add(source).out
+      val Eventos = builder.add(source).out
 
-    val Publicar =
-      builder.add(Broadcast[HolderAddedToAccount](2))
+      val Publicar =
+        builder.add(Broadcast[TitularAnadidoALaCuenta](2))
 
-    val Enriquecer
-      = builder.add(Flow[HolderAddedToAccount].map(item => item.copy(accountId = "ING-" + item.accountId)))
+      val Enriquecer
+      = builder.add(Flow[TitularAnadidoALaCuenta].map(item => item.copy(accountId = "ING-" + item.accountId)))
 
-    val AlaCuenta
-      = builder.add(Flow[HolderAddedToAccount].mapAsync(10)(event =>
-          (shardingForAccounts ? event).mapTo[String]))
+      val AlaCuenta
+      = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event =>
+        (shardingParaCuentas ? event).mapTo[String]))
 
-    val AlaPosicionGlobal
-      = builder.add(Flow[HolderAddedToAccount].mapAsync(10)(event =>
-         (shardingForPosicionGlobal ? event).mapTo[String]))
+      val AlaPosicionGlobal
+      = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event =>
+        (shardingParaPosicionGlobal ? event).mapTo[String]))
 
-    val Unir = builder.add(Zip[String, String])
+      val Unir = builder.add(Zip[String, String])
 
-    val Comprobar
+      val Comprobar
       = builder.add(Flow[(String, String)].map(tuple => {
-          logging.info("received " + tuple._1 + " and " + tuple._2)
-          val items = List(tuple._1, tuple._2)
-          if (items.distinct.size == 1 && items.head == "Success")
-             "success"
-           else
-            "failure"
-         }
-    ))
+        logging.info("received " + tuple._1 + " and " + tuple._2)
+        val items = List(tuple._1, tuple._2)
+        if (items.distinct.size == 1 && items.head == "Success")
+          "success"
+        else
+          "failure"
+      }
+      ))
 
-    val Sumidero = builder.add(Sink.foreach(println)).in
-    
+      val Sumidero = builder.add(Sink.foreach(println)).in
 
-    Src ~> Enriquecer ~> Publicar ~> AlaCuenta         ~> Unir.in0
-                         Publicar ~> AlaPosicionGlobal ~> Unir.in1
-                                                          Unir.out ~> Comprobar ~> Sumidero
 
-    ClosedShape
-  })
+      Eventos ~> Enriquecer ~> Publicar ~> AlaCuenta         ~> Unir.in0
+                               Publicar ~> AlaPosicionGlobal ~> Unir.in1
+                                                                Unir.out ~> Comprobar ~> Sumidero
+
+      ClosedShape
+    })
 
   graph.run()
 
 }
-
-
-
-
 
 
 /*
@@ -198,6 +231,10 @@ class AccountService {
   }
 
 }
+
+case class AccountInformation(accountId: String,
+                              holders: List[String])
+
 */
 
 
