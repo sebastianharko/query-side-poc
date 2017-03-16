@@ -14,7 +14,7 @@ import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Sink, Source, Zip}
 import org.json4s.{DefaultFormats, jackson}
 
 import scala.collection.mutable
-import scala.concurrent.{Future, Promise}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.Try
 
 case class ObtenerInfo(id: String)
@@ -68,7 +68,7 @@ class ActorTitular extends PersistentActor with ActorLogging {
 
 }
 
-case class CuentaDTO(titulares: List[String]) extends ProductoDTO
+case class CuentaDTO(id: String, titulares: List[String]) extends ProductoDTO
 
 case class ObtenerTitulares(cuentaId: String)
 
@@ -84,7 +84,8 @@ class ActorCuenta extends PersistentActor with ActorLogging {
         titulares.append(event.nuevaTitularId)
         sender ! "Success"
       }
-    case ObtenerTitulares(_) => sender() ! CuentaDTO(titulares.toList)
+      // TODO: Should return Option[CuentaDTO] or something else
+    case ObtenerTitulares(cuentaId) => sender() ! CuentaDTO(cuentaId, titulares.toList)
   }
 
   def receiveRecover = {
@@ -233,19 +234,18 @@ case class ListaProductos(productos: List[(String, TipoProducto)])
 
 trait ServicioProductos {
 
-  def obtenerListaProductos(personaId: String): FutureEither[ListaProductos] = {
+  def obtenerListaProductos(personaId: String)(implicit ec:ExecutionContext): FutureEither[ListaProductos] = {
 
-    val promis = Promise[ Either[Error, ListaProductos ]]()
+    val promis = Promise[ ListaProductos ]()
 
     new Thread {
       () =>
         Thread.sleep( (Math.random() * 1000).toInt)
-        promis.complete(Try(Right(ListaProductos(List("1" -> Cuenta, "2" -> Hipoteca)))))
+        promis.complete(Try( ListaProductos(List("1" -> Cuenta, "2" -> Hipoteca))))
     }.run()
 
     // mock
-    val result = new FutureEither(promis.future)
-    result
+    FutureEither.fromFuture(promis.future)
   }
 
 }
@@ -253,53 +253,68 @@ trait ServicioProductos {
 case class HipotecaDTO(id: String, saldo: Int) extends ProductoDTO
 
 trait Servicio {
+  def obtenerInfo(productoId: String)(implicit ec: ExecutionContext): FutureEither[ProductoDTO]
+}
 
-  def obtenerInfo(productoId: String): FutureEither[ProductoDTO]
+trait ConPlanA {
+  def planA(productoId: String)(implicit ec: ExecutionContext): FutureEither[Option[ProductoDTO]]
+}
 
+trait ConPlanB {
+  def planB(productoId: String)(implicit ec: ExecutionContext): FutureEither[ProductoDTO]
 }
 
 
-trait ServicioDefault {
+trait ServicioModernizado extends Servicio with ConPlanA with ConPlanB {
 
-  def obtenerProdInfo(productoId: String): FutureEither[ProductoDTO]
-
-  def obtenerInfo(productoId: String): FutureEither[ProductoDTO] = obtenerProdInfo(productoId)
-}
-
-trait ServicioEntidad {
-  def obtenerDesdeEntidad(productoId: String): FutureEither[Option[ProductoDTO]]
-}
-
-trait ServicioConCache extends ServicioDefault with ServicioEntidad {
-
-   override def obtenerInfo(productoId: String): FutureEither[ProductoDTO] = {
-
+  override def obtenerInfo(productoId: String)(implicit ec: ExecutionContext) = {
     import FutureEither.successful
 
     for {
-      cache <- super.obtenerDesdeEntidad(productoId)
-
-      result <- cache match {
-                  case Some( value ) => successful(  value )
-                  case _ => super.obtenerProdInfo( productoId )
-                }
-
+      resultA <- planA(productoId)
+      result <- resultA match {
+        case Some( value ) => successful(  value )
+        case _ => planB(productoId)
+      }
     } yield result
+  }
+}
 
+trait ConActores {
+  self: ConPlanA =>
+
+  val actorSystem: ActorSystem
+
+  val nombreRegionSharding: String
+
+  def planA(productoId: String)(implicit ec: ExecutionContext): FutureEither[Option[ProductoDTO]] = {
+    val result = (ClusterSharding(actorSystem).shardRegion(nombreRegionSharding) ? ObtenerInfo(productoId))
+      .mapTo[ProductoDTO].map(p => Some(p))
+    FutureEither.fromFuture(result)
   }
 
 }
 
-class ServicioCuentas extends ServicioConCache {
+class SerivicioCuentas(val actorSystem: ActorSystem) extends ServicioModernizado with ConActores {
 
-  override def obtenerDesdeEntidad(productoId: String): FutureEither[Option[ProductoDTO]] = ???
+  override val nombreRegionSharding: String = "cuentas"
 
-  override def obtenerProdInfo(productoId: String): FutureEither[ProductoDTO] = ???
+  override def planB(productoId: String)(implicit ec: ExecutionContext): FutureEither[ProductoDTO] = {
+
+    val promis = Promise[CuentaDTO]()
+
+    new Thread {
+      () =>
+        Thread.sleep((Math.random() * 1000).toInt)
+      promis.complete(Try(CuentaDTO(productoId, titulares = List("A", s"B"))))
+    }.run()
+
+    // mock
+    FutureEither.fromFuture(promis.future)
+  }
+
+
 }
-
-
-
-
 
 
 class ServicioPosicionesGlobales(servicioProductos: ServicioProductos, servicios: Map[TipoProducto, Servicio])
@@ -313,7 +328,7 @@ class ServicioPosicionesGlobales(servicioProductos: ServicioProductos, servicios
 
       listaProductos <- servicioProductos.obtenerListaProductos(personaId)
 
-      listaDetalleProducto <- successful(listaProductos.productos.map { case (id, tipoProducto) =>  servicios(tipoProducto).obtenerProdInfo(id) } )
+      listaDetalleProducto <- successful(listaProductos.productos.map { case (id, tipoProducto) =>  servicios(tipoProducto).obtenerInfo(id) } )
 
       positionGlobal <- sequence(listaDetalleProducto)
 
