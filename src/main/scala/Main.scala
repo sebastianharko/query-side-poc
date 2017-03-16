@@ -1,7 +1,7 @@
 package querysidepoc
 
 
-import akka.actor.{ActorLogging, ActorRef, ActorSystem, Props}
+import akka.actor.{ActorLogging, ActorSystem, Props}
 import akka.cluster.sharding.{ClusterSharding, ClusterShardingSettings, ShardRegion}
 import akka.event.{Logging, LoggingReceive}
 import akka.http.scaladsl.Http
@@ -14,11 +14,13 @@ import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Sink, Source, Zip}
 import org.json4s.{DefaultFormats, jackson}
 
 import scala.collection.mutable
+import scala.concurrent.{Future, Promise}
+import scala.util.Try
 
+case class ObtenerInfo(id: String)
 
 case class TitularAnadidoALaCuenta(cuentaId: String,
                                    nuevaTitularId: String)
-
 
 object ActorTitular {
 
@@ -32,10 +34,10 @@ object ActorTitular {
   val extractShardId: ShardRegion.ExtractShardId = {
     case TitularAnadidoALaCuenta(cuentaId, nuevaTitularId) => nuevaTitularId.head.toString
     case ObtenerCuentasForTitular(personaId) => personaId.head.toString
-
   }
-
 }
+
+sealed trait ProductoDTO
 
 case class ObtenerCuentasForTitular(personaId: String)
 
@@ -66,7 +68,7 @@ class ActorTitular extends PersistentActor with ActorLogging {
 
 }
 
-case class TitularesDTO(titulares: List[String])
+case class CuentaDTO(titulares: List[String]) extends ProductoDTO
 
 case class ObtenerTitulares(cuentaId: String)
 
@@ -82,7 +84,7 @@ class ActorCuenta extends PersistentActor with ActorLogging {
         titulares.append(event.nuevaTitularId)
         sender ! "Success"
       }
-    case ObtenerTitulares(_) => sender() ! TitularesDTO(titulares.toList)
+    case ObtenerTitulares(_) => sender() ! CuentaDTO(titulares.toList)
   }
 
   def receiveRecover = {
@@ -115,9 +117,7 @@ object Main extends App {
   import scala.concurrent.duration._
 
   implicit val timeout = akka.util.Timeout(10 seconds)
-
   implicit val system = ActorSystem("query-side-poc")
-
   implicit val materializer = ActorMaterializer()
 
   val actorRefSource = Source.actorRef[TitularAnadidoALaCuenta](100, OverflowStrategy.fail)
@@ -126,6 +126,7 @@ object Main extends App {
 
   implicit val serialization = jackson.Serialization
   implicit val formats = DefaultFormats
+
 
 
   val logging = Logging(system, classOf[Main])
@@ -138,7 +139,7 @@ object Main extends App {
     extractShardId = ActorCuenta.extractShardId
   )
 
-  val shardingParaPosicionGlobal = ClusterSharding(system).start(
+  val shardingParaTitulares = ClusterSharding(system).start(
     typeName = "titulares",
     entityProps = ActorTitular.props,
     settings = ClusterShardingSettings(system),
@@ -157,13 +158,9 @@ object Main extends App {
 
       val Enriquecer = builder.add(Flow[TitularAnadidoALaCuenta].map(item => item.copy(cuentaId = "CUENTA-" + item.cuentaId)))
 
-      val AlaCuenta
-      = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event =>
-        (shardingParaCuentas ? event).mapTo[String]))
+      val AlaCuenta = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event => (shardingParaCuentas ? event).mapTo[String]))
 
-      val AlTitular
-      = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event =>
-        (shardingParaPosicionGlobal ? event).mapTo[String]))
+      val AlTitular = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event => (shardingParaTitulares ? event).mapTo[String]))
 
       val Unir = builder.add(Zip[String, String])
 
@@ -199,7 +196,7 @@ object Main extends App {
   } ~ get {
     path("cuenta" / Segment) {
       cuentaId: String => {
-        onComplete((shardingParaCuentas ? ObtenerTitulares(cuentaId)).mapTo[TitularesDTO]) {
+        onComplete((shardingParaCuentas ? ObtenerTitulares(cuentaId)).mapTo[CuentaDTO]) {
           case scala.util.Success(dto) => complete(OK -> dto)
           case scala.util.Failure(_) => complete(InternalServerError)
         }
@@ -208,7 +205,7 @@ object Main extends App {
   } ~ get {
     path("titular" / Segment) {
       personaId: String => {
-        onComplete((shardingParaPosicionGlobal ? ObtenerCuentasForTitular(personaId)).mapTo[TitularDTO]) {
+        onComplete((shardingParaTitulares ? ObtenerCuentasForTitular(personaId)).mapTo[TitularDTO]) {
           case scala.util.Success(dto) => complete(OK -> dto)
           case scala.util.Failure(_) => complete(InternalServerError)
         }
@@ -218,10 +215,191 @@ object Main extends App {
 
   Http().bindAndHandle(route, "localhost", 8080)
 
+}
 
+
+sealed trait Error
+
+case class PersonaNoEncontrado(personaId: String) extends Error
+case class ErrorGenerico(e: Throwable) extends Error
+
+sealed trait TipoProducto
+case object Tarjeta extends TipoProducto
+case object Cuenta extends TipoProducto
+case object Prestamo extends TipoProducto
+case object Hipoteca extends TipoProducto // Legacy backend (no events)
+
+case class ListaProductos(productos: List[(String, TipoProducto)])
+
+trait ServicioProductos {
+
+  def obtenerListaProductos(personaId: String): FutureEither[ListaProductos] = {
+
+    val promis = Promise[ Either[Error, ListaProductos ]]()
+
+    new Thread {
+      () =>
+        Thread.sleep( (Math.random() * 1000).toInt)
+        promis.complete(Try(Right(ListaProductos(List("1" -> Cuenta, "2" -> Hipoteca)))))
+    }.run()
+
+    // mock
+    val result = new FutureEither(promis.future)
+    result
+  }
 
 }
 
+case class HipotecaDTO(id: String, saldo: Int) extends ProductoDTO
+
+trait Servicio {
+
+  def obtenerInfo(productoId: String): FutureEither[ProductoDTO]
+
+}
+
+
+trait ServicioDefault {
+
+  def obtenerProdInfo(productoId: String): FutureEither[ProductoDTO]
+
+  def obtenerInfo(productoId: String): FutureEither[ProductoDTO] = obtenerProdInfo(productoId)
+}
+
+trait ServicioEntidad {
+  def obtenerDesdeEntidad(productoId: String): FutureEither[Option[ProductoDTO]]
+}
+
+trait ServicioConCache extends ServicioDefault with ServicioEntidad {
+
+   override def obtenerInfo(productoId: String): FutureEither[ProductoDTO] = {
+
+    import FutureEither.successful
+
+    for {
+      cache <- super.obtenerDesdeEntidad(productoId)
+
+      result <- cache match {
+                  case Some( value ) => successful(  value )
+                  case _ => super.obtenerProdInfo( productoId )
+                }
+
+    } yield result
+
+  }
+
+}
+
+class ServicioCuentas extends ServicioConCache {
+
+  override def obtenerDesdeEntidad(productoId: String): FutureEither[Option[ProductoDTO]] = ???
+
+  override def obtenerProdInfo(productoId: String): FutureEither[ProductoDTO] = ???
+}
+
+
+
+
+
+
+class ServicioPosicionesGlobales(servicioProductos: ServicioProductos, servicios: Map[TipoProducto, Servicio])
+                                (implicit val ec: scala.concurrent.ExecutionContext) {
+
+  def obtenerPosicionGlobal(personaId: String) : FutureEither[List[ProductoDTO]] = {
+
+    import FutureEither._
+
+    for {
+
+      listaProductos <- servicioProductos.obtenerListaProductos(personaId)
+
+      listaDetalleProducto <- successful(listaProductos.productos.map { case (id, tipoProducto) =>  servicios(tipoProducto).obtenerProdInfo(id) } )
+
+      positionGlobal <- sequence(listaDetalleProducto)
+
+    } yield positionGlobal
+
+  }
+
+}
+
+
+
+import scala.concurrent.{ExecutionContext => ExecCtx}
+
+object FutureEither {
+
+  def fromFuture[T](future: Future[T])(implicit ec: ExecCtx): FutureEither[T] = {
+
+    val futureE : Future[Either[Error,T]] = future map {
+      s : T => Right[Error,T](s)
+    } recover {
+      case e: Throwable => Left( ErrorGenerico(e) )
+    }
+
+    new FutureEither( futureE )
+
+  }
+
+
+  def successful[T](value: T)(implicit ec: ExecCtx) = new FutureEither[T](Future.apply(Right(value)))
+
+  def failure[T](value: Error)(implicit ec: ExecCtx) = new FutureEither[T](Future.apply(Left(value)))
+
+  def sequence[T](list: List[FutureEither[T]])(implicit ec: ExecCtx): FutureEither[List[T]] = {
+
+    def _sequence[T](from: List[FutureEither[T]], result: FutureEither[List[T]]): FutureEither[List[T]] = {
+
+      from match {
+
+        case h :: t => {
+
+          for {
+
+            reg <- h
+
+            list <- _sequence(t, result)
+
+          } yield reg +: list
+
+        }
+
+        case e => result
+
+      }
+    }
+
+      _sequence(list, successful(List[T]()))
+
+    }
+
+}
+
+class FutureEither[B](val future: Future[Either[Error ,B]]) {
+
+  def toFutureEither: FutureEither[B] = this
+
+  def map[BB](f: B => BB)(implicit ec: ExecCtx) =
+    new FutureEither[BB](
+      future recover {
+        case e: Throwable => Left( ErrorGenerico(e) )
+      } map {
+        case Left(a)  => Left(a)
+        case Right(b) => Right(f(b))
+      }
+    )
+
+  def flatMap[BB](f: B => FutureEither[BB])(implicit ec: ExecCtx) =
+    new FutureEither[BB](
+      future recover {
+        case e: Throwable => Left( ErrorGenerico(e) )
+      } flatMap {
+        case Left(a)  => Future successful Left(a)
+        case Right(b) => f(b).future
+      }
+    )
+
+}
 
 /*
 case class TransactionEvent(transactionId: String,
@@ -241,6 +419,14 @@ class AccountService {
 case class AccountInformation(accountId: String,
                               holders: List[String])
 
+*/
+
+/*
+CreditCard           |  New Backend (from events) -> no cache
+Loan                 |  New Backend (from events) -> no cache
+House                |  New Backend (from events) -> no cache
+Checking Account     |  New Backend (from events) -> no cache
+Savings Account      |  Legacy Backend (REST API call) but we can still create an actor (persistent)   ... cache (TTL ... 2 seconds)
 */
 
 
