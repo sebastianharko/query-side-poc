@@ -11,8 +11,10 @@ import akka.pattern.ask
 import akka.persistence.PersistentActor
 import akka.stream._
 import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Sink, Source, Zip}
+import akka.util.Timeout
 import org.json4s.{DefaultFormats, jackson}
 
+import scala.concurrent.duration._
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.Try
@@ -221,6 +223,7 @@ object Main extends App {
 
 sealed trait Error
 
+case class CuentaNoEncontrada(cuentaId: String) extends Error
 case class PersonaNoEncontrado(personaId: String) extends Error
 case class ErrorGenerico(e: Throwable) extends Error
 
@@ -245,7 +248,7 @@ trait ServicioProductos {
     }.run()
 
     // mock
-    FutureEither.fromFuture(promis.future)
+    FutureEither.successfulWith(promis.future)
   }
 
 }
@@ -285,12 +288,14 @@ trait ConActores {
 
   val actorSystem: ActorSystem
 
+  implicit val timeout: akka.util.Timeout
+
   val nombreRegionSharding: String
 
   def planA(productoId: String)(implicit ec: ExecutionContext): FutureEither[Option[ProductoDTO]] = {
     val result = (ClusterSharding(actorSystem).shardRegion(nombreRegionSharding) ? ObtenerInfo(productoId))
       .mapTo[ProductoDTO].map(p => Some(p))
-    FutureEither.fromFuture(result)
+    FutureEither.successfulWith(result)
   }
 
 }
@@ -298,6 +303,8 @@ trait ConActores {
 class SerivicioCuentas(val actorSystem: ActorSystem) extends ServicioModernizado with ConActores {
 
   override val nombreRegionSharding: String = "cuentas"
+
+  implicit val timeout: akka.util.Timeout = Timeout(7 seconds)
 
   override def planB(productoId: String)(implicit ec: ExecutionContext): FutureEither[ProductoDTO] = {
 
@@ -310,7 +317,7 @@ class SerivicioCuentas(val actorSystem: ActorSystem) extends ServicioModernizado
     }.run()
 
     // mock
-    FutureEither.fromFuture(promis.future)
+    FutureEither.successfulWith(promis.future)
   }
 
 
@@ -344,7 +351,8 @@ import scala.concurrent.{ExecutionContext => ExecCtx}
 
 object FutureEither {
 
-  def fromFuture[T](future: Future[T])(implicit ec: ExecCtx): FutureEither[T] = {
+
+  def successfulWith[T](future: Future[T])(implicit ec: ExecCtx): FutureEither[T] = {
 
     val futureE : Future[Either[Error,T]] = future map {
       s : T => Right[Error,T](s)
@@ -356,6 +364,7 @@ object FutureEither {
 
   }
 
+  def failureWith[T](future: Future[Error])(implicit ec: ExecCtx): FutureEither[T] = ???
 
   def successful[T](value: T)(implicit ec: ExecCtx) = new FutureEither[T](Future.apply(Right(value)))
 
@@ -390,27 +399,37 @@ object FutureEither {
 
 }
 
-class FutureEither[B](val future: Future[Either[Error ,B]]) {
+class FutureEither[B](private val future: Future[Either[Error ,B]]) {
 
   def toFutureEither: FutureEither[B] = this
 
   def map[BB](f: B => BB)(implicit ec: ExecCtx) =
     new FutureEither[BB](
-      future recover {
-        case e: Throwable => Left( ErrorGenerico(e) )
-      } map {
+      future map {
         case Left(a)  => Left(a)
         case Right(b) => Right(f(b))
+      } recover {
+        case e: Throwable => Left( ErrorGenerico(e) )
+      }
+    )
+
+  def recover[B](f: Error => B)(implicit ec: ExecCtx) =
+    new FutureEither[B](
+      future map {
+        case Left(a: Error)  => Right[Error, B](f(a))
+        case Right(b: B) =>  Right[Error, B]( b )
+      } recover {
+        case e: Throwable => Left( ErrorGenerico(e) )
       }
     )
 
   def flatMap[BB](f: B => FutureEither[BB])(implicit ec: ExecCtx) =
     new FutureEither[BB](
-      future recover {
-        case e: Throwable => Left( ErrorGenerico(e) )
-      } flatMap {
+      future  flatMap {
         case Left(a)  => Future successful Left(a)
         case Right(b) => f(b).future
+      } recover {
+        case e: Throwable => Left( ErrorGenerico(e) )
       }
     )
 
