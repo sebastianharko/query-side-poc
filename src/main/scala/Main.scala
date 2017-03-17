@@ -301,7 +301,7 @@ class ServicioProductos {
     new Thread {
       () =>
         Thread.sleep( (Math.random() * 1000).toInt)
-        promis.complete(Try( ListaProductos(List("1" -> Cuenta, "2" -> Hipoteca))))
+        promis.complete(Try( ListaProductos(List("CUENTA-1" -> Cuenta, "2" -> Hipoteca))))
     }.run()
 
     // mock
