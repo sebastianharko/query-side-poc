@@ -17,7 +17,9 @@ import org.json4s.{DefaultFormats, jackson}
 import scala.concurrent.duration._
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.language.{implicitConversions, postfixOps}
 import scala.util.Try
+import FutureEither.convertToFuture
 
 case class ObtenerInfo(id: String)
 
@@ -25,6 +27,8 @@ case class TitularAnadidoALaCuenta(cuentaId: String,
                                    nuevaTitularId: String)
 
 object ActorTitular {
+
+  val TitularRegionName = "titular"
 
   def props = Props(new ActorTitular)
 
@@ -74,6 +78,8 @@ case class CuentaDTO(id: String, titulares: List[String]) extends ProductoDTO
 
 case class ObtenerTitulares(cuentaId: String)
 
+case object NoEncontrada extends ProductoDTO
+
 class ActorCuenta extends PersistentActor with ActorLogging {
 
   override def persistenceId = self.path.name
@@ -81,13 +87,23 @@ class ActorCuenta extends PersistentActor with ActorLogging {
   val titulares = mutable.ArrayBuffer[String]()
 
   override def receiveCommand = LoggingReceive {
+
     case msg@TitularAnadidoALaCuenta(cuentaId, titularId) =>
       persist(msg) { event =>
         titulares.append(event.nuevaTitularId)
         sender ! "Success"
       }
-      // TODO: Should return Option[CuentaDTO] or something else
-    case ObtenerTitulares(cuentaId) => sender() ! CuentaDTO(cuentaId, titulares.toList)
+
+    case ObtenerTitulares(cuentaId) =>
+       // to keep the other demo working
+       sender() ! CuentaDTO(cuentaId, titulares.toList)
+
+    case ObtenerInfo(cuentaId) =>
+      if (titulares.nonEmpty)
+        sender() ! CuentaDTO(cuentaId, titulares.toList)
+      else
+        sender ! NoEncontrada
+
   }
 
   def receiveRecover = {
@@ -99,17 +115,20 @@ class ActorCuenta extends PersistentActor with ActorLogging {
 
 object ActorCuenta {
 
+  val CuentaRegionName = "cuenta"
 
   def props = Props(new ActorCuenta)
 
   val extractEntityId: ShardRegion.ExtractEntityId = {
     case msg @ TitularAnadidoALaCuenta(cuentaId, nuevoTitularId) ⇒ (cuentaId, msg)
     case msg @ ObtenerTitulares(cuentaId) => (cuentaId, msg)
+    case msg @ ObtenerInfo(id) => (id, msg)
   }
 
   val extractShardId: ShardRegion.ExtractShardId = {
     case TitularAnadidoALaCuenta(cuentaId, nuevoTitularId) => cuentaId.head.toString
     case msg @ ObtenerTitulares(cuentaId) => cuentaId.head.toString
+    case msg @ ObtenerInfo(id) => id.head.toString
   }
 }
 
@@ -123,6 +142,21 @@ object Main extends App {
   implicit val system = ActorSystem("query-side-poc")
   implicit val materializer = ActorMaterializer()
 
+  implicit val ec: ExecutionContext = system.dispatcher
+
+  val servicioCuentas = new SerivicioCuentas(system)
+  val servicioHipotecas = new ServicioHipotecas
+
+  val servicios: Map[TipoProducto, Servicio] = Map(
+    Cuenta -> servicioCuentas,
+    Hipoteca -> servicioHipotecas
+  )
+
+  val servicioProductos = new ServicioProductos
+
+  val servicioPosicionesGlobales = new ServicioPosicionesGlobales(servicioProductos, servicios)
+
+
   val actorRefSource = Source.actorRef[TitularAnadidoALaCuenta](100, OverflowStrategy.fail)
 
   import de.heikoseeberger.akkahttpjson4s.Json4sSupport._
@@ -131,11 +165,10 @@ object Main extends App {
   implicit val formats = DefaultFormats
 
 
-
   val logging = Logging(system, classOf[Main])
 
   val shardingParaCuentas = ClusterSharding(system).start(
-    typeName = "cuenta",
+    typeName = ActorCuenta.CuentaRegionName,
     entityProps = ActorCuenta.props,
     settings = ClusterShardingSettings(system),
     extractEntityId = ActorCuenta.extractEntityId,
@@ -143,7 +176,7 @@ object Main extends App {
   )
 
   val shardingParaTitulares = ClusterSharding(system).start(
-    typeName = "titulares",
+    typeName = ActorTitular.TitularRegionName,
     entityProps = ActorTitular.props,
     settings = ClusterShardingSettings(system),
     extractEntityId = ActorTitular.extractEntityId,
@@ -188,6 +221,9 @@ object Main extends App {
 
   val sourceActorRef = flow.runWith(actorRefSource, Sink.foreach(msg => logging.info("acknowledge")))._1
 
+  implicit def fromFutEToFut[T](v: FutureEither[T]): Future[Either[Error, T]] = convertToFuture(v)
+
+
   val route = post {
     path("cuenta" / Segment / "titular" / Segment) {
       (cuentaId: String, titularId: String) => {
@@ -214,6 +250,18 @@ object Main extends App {
         }
       }
     }
+  } ~ get {
+    path("posicion" / Segment) {
+      personaId: String => {
+        onComplete(servicioPosicionesGlobales.obtenerPosicionGlobal(personaId)) {
+          case scala.util.Success(actualResult) => actualResult match {
+            case Left(error) => complete(InternalServerError -> error.description)
+            case Right(value) => complete(OK -> value)
+          }
+          case scala.util.Failure(_) => complete(InternalServerError)
+        }
+      }
+    }
   }
 
   Http().bindAndHandle(route, "localhost", 8080)
@@ -221,11 +269,20 @@ object Main extends App {
 }
 
 
-sealed trait Error
+sealed trait Error {
+  val description: String
+}
 
-case class CuentaNoEncontrada(cuentaId: String) extends Error
-case class PersonaNoEncontrado(personaId: String) extends Error
-case class ErrorGenerico(e: Throwable) extends Error
+case class CuentaNoEncontrada(cuentaId: String) extends Error {
+  override val description = "Cuenta con id " + cuentaId + " no encontrada"
+}
+case class PersonaNoEncontrado(personaId: String) extends Error {
+  override val description = "Persona con id " + personaId + " no encontrada"
+
+}
+case class ErrorGenerico(e: Throwable) extends Error {
+  override val description = "Error generico " + e.getMessage
+}
 
 sealed trait TipoProducto
 case object Tarjeta extends TipoProducto
@@ -235,7 +292,7 @@ case object Hipoteca extends TipoProducto // Legacy backend (no events)
 
 case class ListaProductos(productos: List[(String, TipoProducto)])
 
-trait ServicioProductos {
+class ServicioProductos {
 
   def obtenerListaProductos(personaId: String)(implicit ec:ExecutionContext): FutureEither[ListaProductos] = {
 
@@ -253,7 +310,7 @@ trait ServicioProductos {
 
 }
 
-case class HipotecaDTO(id: String, saldo: Int) extends ProductoDTO
+case class HipotecaDTO(id: String, total: Int, restante: Int, intereses: Int) extends ProductoDTO
 
 trait Servicio {
   def obtenerInfo(productoId: String)(implicit ec: ExecutionContext): FutureEither[ProductoDTO]
@@ -294,7 +351,9 @@ trait ConActores {
 
   def planA(productoId: String)(implicit ec: ExecutionContext): FutureEither[Option[ProductoDTO]] = {
     val result = (ClusterSharding(actorSystem).shardRegion(nombreRegionSharding) ? ObtenerInfo(productoId))
-      .mapTo[ProductoDTO].map(p => Some(p))
+      .mapTo[ProductoDTO].map { case NoEncontrada => Option.empty[ProductoDTO]
+                                case q:ProductoDTO => Some(q) }
+
     FutureEither.successfulWith(result)
   }
 
@@ -302,7 +361,7 @@ trait ConActores {
 
 class SerivicioCuentas(val actorSystem: ActorSystem) extends ServicioModernizado with ConActores {
 
-  override val nombreRegionSharding: String = "cuentas"
+  override val nombreRegionSharding: String = ActorCuenta.CuentaRegionName
 
   implicit val timeout: akka.util.Timeout = Timeout(7 seconds)
 
@@ -320,7 +379,23 @@ class SerivicioCuentas(val actorSystem: ActorSystem) extends ServicioModernizado
     FutureEither.successfulWith(promis.future)
   }
 
+}
 
+
+class ServicioHipotecas extends Servicio {
+  override def obtenerInfo(productoId: String)(implicit ec: ExecutionContext): FutureEither[ProductoDTO] =
+    {
+      val promis = Promise[HipotecaDTO]()
+
+      new Thread {
+        () =>
+          Thread.sleep((Math.random() * 1000).toInt)
+        promis.complete(Try(HipotecaDTO(productoId, total = 250000, restante = 125000, intereses = 5)))
+      }.run()
+
+      // mock
+      FutureEither.successfulWith(promis.future)
+    }
 }
 
 
@@ -335,7 +410,7 @@ class ServicioPosicionesGlobales(servicioProductos: ServicioProductos, servicios
 
       listaProductos <- servicioProductos.obtenerListaProductos(personaId)
 
-      listaDetalleProducto <- successful(listaProductos.productos.map { case (id, tipoProducto) =>  servicios(tipoProducto).obtenerInfo(id) } )
+      listaDetalleProducto <- successful(listaProductos.productos.map { case (id: String, tipoProducto: TipoProducto) =>  servicios(tipoProducto).obtenerInfo(id) } )
 
       positionGlobal <- sequence(listaDetalleProducto)
 
@@ -350,6 +425,25 @@ class ServicioPosicionesGlobales(servicioProductos: ServicioProductos, servicios
 import scala.concurrent.{ExecutionContext => ExecCtx}
 
 object FutureEither {
+
+  def convertToFuture[T]( f: FutureEither[T] )(implicit ec: ExecCtx) : Future[Either[Error,T]] = {
+
+    val prom = Promise[Either[Error, T]]()
+
+    f map {
+      s: T =>
+        prom.success(new Right[Error, T](s))
+        s
+    } recover {
+      s =>
+        prom.success(new Left[Error, T](s))
+        s
+
+    }
+
+    prom.future
+
+  }
 
 
   def successfulWith[T](future: Future[T])(implicit ec: ExecCtx): FutureEither[T] = {
