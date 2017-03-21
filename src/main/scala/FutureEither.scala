@@ -8,19 +8,17 @@ object FutureEither {
 
     val prom = Promise[Either[Error, T]]()
 
-    f map {
+    f map[Option[T]] {
       s: T =>
         prom.success(new Right[Error, T](s))
-        s
+        Option(s)
     } recover {
       s =>
         prom.success(new Left[Error, T](s))
-        s
-
+        Option.empty
     }
 
     prom.future
-
   }
 
 
@@ -85,11 +83,11 @@ class FutureEither[B](private val future: Future[Either[Error ,B]]) {
       }
     )
 
-  def recover[B](f: Error => B)(implicit ec: ExecCtx) =
+  def recover(f: Error => B)(implicit ec: ExecCtx) =
     new FutureEither[B](
       future map {
         case Left(a: Error)  => Right[Error, B](f(a))
-        case Right(b: B) =>  Right[Error, B]( b )
+        case Right(b) =>  Right[Error, B]( b )
       } recover {
         case e: Throwable => Left( ErrorGenerico(e) )
       }
