@@ -1,7 +1,7 @@
 package querysidepoc
 
 
-import akka.actor.{ActorLogging, ActorSystem, Props}
+import akka.actor.{ActorLogging, ActorRef, ActorSystem, Props}
 import akka.cluster.sharding.{ClusterSharding, ClusterShardingSettings, ShardRegion}
 import akka.event.{Logging, LoggingReceive}
 import akka.http.scaladsl.Http
@@ -10,7 +10,7 @@ import akka.http.scaladsl.server.Directives._
 import akka.pattern.ask
 import akka.persistence.PersistentActor
 import akka.stream._
-import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Sink, Source, Zip}
+import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Sink, Source, Zip, ZipN}
 import akka.util.Timeout
 import org.json4s.{DefaultFormats, jackson}
 
@@ -21,10 +21,16 @@ import scala.language.{implicitConversions, postfixOps}
 import scala.util.Try
 import FutureEither.convertToFuture
 
+import scala.collection.mutable.ArrayBuffer
+
 case class ObtenerInfo(id: String)
 
 case class TitularAnadidoALaCuenta(cuentaId: String,
                                    nuevaTitularId: String)
+
+case class TitularAnadidoALaCuentaComplex(existingTitularId: String, cuentaId: String, nuevaTitularId: String)
+
+
 
 object ActorTitular {
 
@@ -117,6 +123,7 @@ object ActorCuenta {
 
   val CuentaRegionName = "cuenta"
 
+
   def props = Props(new ActorCuenta)
 
   val extractEntityId: ShardRegion.ExtractEntityId = {
@@ -131,6 +138,109 @@ object ActorCuenta {
     case msg @ ObtenerInfo(id) => id.head.toString
   }
 }
+
+
+class ActorCuentaComplex(complexTitulares: ActorRef) extends PersistentActor with ActorLogging {
+
+  val existingTitulares = mutable.ArrayBuffer[String]()
+
+  override def persistenceId = self.path.name
+
+  override def receiveCommand: Receive = LoggingReceive {
+
+    case msg @ TitularAnadidoALaCuenta(cuentaId, newTitularId) =>
+      persist(msg) { event =>
+        existingTitulares.append(event.nuevaTitularId)
+        existingTitulares.foreach {
+          existingTitularId => complexTitulares ! TitularAnadidoALaCuentaComplex(existingTitularId, cuentaId, newTitularId)
+        }
+        sender ! "Success"
+      }
+  }
+
+  def receiveRecover = {
+    case TitularAnadidoALaCuenta(cuentaId, nuevoTitularId) =>
+      existingTitulares.append(nuevoTitularId)
+  }
+
+}
+
+object ActorCuentaComplex {
+
+  val CuentaComplexRegionName = "cuenta-complex"
+
+  def props(titularesComplexSharding: ActorRef) = Props(new ActorCuentaComplex(titularesComplexSharding))
+
+  val extractEntityId: ShardRegion.ExtractEntityId = {
+    case msg @ TitularAnadidoALaCuenta(cuentaId, nuevaTitularId) => (cuentaId, msg)
+  }
+
+  val extractShardId: ShardRegion.ExtractShardId = {
+    case TitularAnadidoALaCuenta(cuentaId, nuevoTitularId) => cuentaId.head.toString
+  }
+
+}
+
+object ActorTitularComplex {
+
+  val TitularComplexRegionName = "complex"
+
+  def props = Props(new ActorTitularComplex)
+
+  val extractEntityId: ShardRegion.ExtractEntityId = {
+    case msg @ TitularAnadidoALaCuentaComplex(existingTitularId, cuentaId, nuevaTitularId) ⇒ (existingTitularId, TitularAnadidoALaCuenta(cuentaId, nuevaTitularId))
+    case msg @ ObtenerCuentasForTitular(id) => (id, msg)
+  }
+
+  val extractShardId: ShardRegion.ExtractShardId = {
+    case TitularAnadidoALaCuentaComplex(existingTitularId, cuentaId, nuevaTitularId) => existingTitularId.head.toString
+    case msg @ ObtenerCuentasForTitular(id) => id.head.toString
+  }
+}
+
+
+class ActorTitularComplex extends PersistentActor with ActorLogging {
+
+  import mutable.ArrayBuffer
+
+  var cuentas: Map[String, ArrayBuffer[String]] = Map()
+
+  override def persistenceId = self.path.name
+
+  override def receiveCommand = LoggingReceive {
+
+    case msg @ TitularAnadidoALaCuenta(cuentaId, nuevaTitularId) =>
+      persist(msg) {
+        event => {
+          onTitularesAnadidoALaCuenta(event)
+        }
+      }
+    case msg @ ObtenerCuentasForTitular(_) =>
+      sender() ! cuentas
+  }
+
+  def onTitularesAnadidoALaCuenta(event: TitularAnadidoALaCuenta) = {
+    val cuentaId = event.cuentaId
+    val nuevaTitularId = event.nuevaTitularId
+
+    cuentas.get(cuentaId) match {
+        case None => cuentas = cuentas.+(cuentaId -> ArrayBuffer(nuevaTitularId))
+        case Some(titulares) => titulares.append(nuevaTitularId)
+    }
+  }
+
+
+  override def receiveRecover = {
+    case event @ TitularAnadidoALaCuenta(cuentaId, nuevaTitularId) =>
+      onTitularesAnadidoALaCuenta(event)
+  }
+
+}
+
+
+
+
+
 
 class Main
 
@@ -183,6 +293,21 @@ object Main extends App {
     extractShardId = ActorTitular.extractShardId
   )
 
+  val shardingParaTitularesComplex: ActorRef = ClusterSharding(system).start(
+    typeName = ActorTitularComplex.TitularComplexRegionName,
+    entityProps = ActorTitularComplex.props,
+    settings = ClusterShardingSettings(system),
+    extractEntityId = ActorTitularComplex.extractEntityId,
+    extractShardId = ActorTitularComplex.extractShardId
+  )
+
+  val shardingParaCuentasComplex = ClusterSharding(system).start(
+    typeName = ActorCuentaComplex.CuentaComplexRegionName,
+    entityProps = ActorCuentaComplex.props(shardingParaTitularesComplex),
+    settings = ClusterShardingSettings(system),
+    extractEntityId = ActorCuentaComplex.extractEntityId,
+    extractShardId = ActorCuentaComplex.extractShardId
+  )
 
   import akka.stream.scaladsl.GraphDSL.Implicits._
 
@@ -190,20 +315,20 @@ object Main extends App {
     Flow.fromGraph(GraphDSL.create() { implicit builder =>
 
       val Publicar =
-        builder.add(Broadcast[TitularAnadidoALaCuenta](2))
+        builder.add(Broadcast[TitularAnadidoALaCuenta](3))
 
-      val Enriquecer = builder.add(Flow[TitularAnadidoALaCuenta].map(item => item.copy(cuentaId = "CUENTA-" + item.cuentaId)))
+      val Enriquecer = builder.add(Flow[TitularAnadidoALaCuenta].map(item => item.copy(cuentaId = item.cuentaId)))
 
       val AlaCuenta = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event => (shardingParaCuentas ? event).mapTo[String]))
 
       val AlTitular = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event => (shardingParaTitulares ? event).mapTo[String]))
 
-      val Unir = builder.add(Zip[String, String])
+      val AlaCuentaComplex = builder.add(Flow[TitularAnadidoALaCuenta].mapAsync(10)(event => (shardingParaCuentasComplex ? event).mapTo[String]))
+
+      val Unir = builder.add(ZipN[String](3))
 
       val Comprobar
-      = builder.add(Flow[(String, String)].map(tuple => {
-        logging.info("received " + tuple._1 + " and " + tuple._2)
-        val items = List(tuple._1, tuple._2)
+      = builder.add(Flow[Seq[String]].map(items => {
         if (items.distinct.size == 1 && items.head == "Success")
           "success"
         else
@@ -211,9 +336,10 @@ object Main extends App {
       }
       ))
 
-       Enriquecer ~> Publicar ~> AlaCuenta   ~> Unir.in0
-                     Publicar ~> AlTitular   ~> Unir.in1
-                                                Unir.out ~> Comprobar
+       Enriquecer ~> Publicar ~> AlaCuentaComplex   ~> Unir.in(0)
+                     Publicar ~> AlTitular          ~> Unir.in(1)
+                     Publicar ~> AlaCuenta          ~> Unir.in(2)
+                                                       Unir.out ~> Comprobar
 
        FlowShape(Enriquecer.in, Comprobar.out)
 
@@ -259,6 +385,17 @@ object Main extends App {
             case Right(value) => complete(OK -> value)
           }
           case scala.util.Failure(_) => complete(InternalServerError)
+        }
+      }
+    }
+  } ~ get {
+    path("complex" / Segment) {
+      personaId: String => {
+        onComplete((shardingParaTitularesComplex ? ObtenerCuentasForTitular(personaId)).mapTo[Map[String, ArrayBuffer[String]]]) {
+          case scala.util.Success(dto: Map[String, ArrayBuffer[String]]) => complete(OK -> dto)
+          case scala.util.Failure(ex) =>
+            logging.error(ex, "error in titular complex query")
+            complete(InternalServerError)
         }
       }
     }
